@@ -1,92 +1,261 @@
 #include "cart_config.hpp"
-#include "poor_caddy_protocol/protocol.hpp"
-#include "poor_caddy_protocol/session_tracker.hpp"
-#include "poor_caddy_protocol/motor_logic.hpp"
-#include "poor_caddy_protocol/ramp.hpp"
-#include "esp_now.h"
-#include "esp_wifi.h"
-#include "nvs_flash.h"
 #include "driver/gpio.h"
-#include "driver/ledc.h"
+#include "esp_now.h"
+#include "esp_timer.h"
+#include "esp_wifi.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/queue.h"
 #include "freertos/task.h"
-#include "esp_timer.h"
+#include "nvs_flash.h"
+#include "odrive_uart.hpp"
+#include "poor_caddy_protocol/motor_policy.hpp"
+#include "poor_caddy_protocol/protocol.hpp"
+#include "poor_caddy_protocol/session_tracker.hpp"
 #include <atomic>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
 using namespace poor_caddy;
-namespace { struct RawRx{std::uint8_t mac[6]; std::uint8_t bytes[64]; int len; std::int8_t rssi; std::uint64_t at_ms;}; QueueHandle_t g_raw_q,g_cmd_q; std::atomic<std::uint32_t> raw_rx{},rx_overflow{},accepted{},timeouts{},estops{},state_transitions{}; std::uint64_t nowMs(){return esp_timer_get_time()/1000ULL;}
-class MotorHw{ public: bool initialize(){ setDigital(cart_config::kLeftStopGpio,true); setDigital(cart_config::kRightStopGpio,true); setDigital(cart_config::kLeftBrakeGpio,false); setDigital(cart_config::kRightBrakeGpio,false); for(int g:{cart_config::kLeftStopGpio,cart_config::kRightStopGpio,cart_config::kLeftBrakeGpio,cart_config::kRightBrakeGpio}) gpio_set_direction(static_cast<gpio_num_t>(g),GPIO_MODE_OUTPUT); gpio_set_direction(static_cast<gpio_num_t>(cart_config::kEstopGpio),GPIO_MODE_INPUT); gpio_set_pull_mode(static_cast<gpio_num_t>(cart_config::kEstopGpio),cart_config::kEstopActiveLow?GPIO_PULLUP_ONLY:GPIO_PULLDOWN_ONLY); ledc_timer_config_t t{LEDC_LOW_SPEED_MODE,LEDC_TIMER_10_BIT,LEDC_TIMER_0,cart_config::kPwmFrequencyHz,LEDC_AUTO_CLK}; if(ledc_timer_config(&t)!=ESP_OK)return false; ledc_channel_config_t l{cart_config::kLeftPwmGpio,LEDC_LOW_SPEED_MODE,LEDC_CHANNEL_0,LEDC_INTR_DISABLE,LEDC_TIMER_0,0,0}; ledc_channel_config_t r{cart_config::kRightPwmGpio,LEDC_LOW_SPEED_MODE,LEDC_CHANNEL_1,LEDC_INTR_DISABLE,LEDC_TIMER_0,0,0}; return ledc_channel_config(&l)==ESP_OK && ledc_channel_config(&r)==ESP_OK;} void setLeftPwm(std::uint16_t d){setPwm(LEDC_CHANNEL_0,d);} void setRightPwm(std::uint16_t d){setPwm(LEDC_CHANNEL_1,d);} void setLeftStop(bool a){setDigital(cart_config::kLeftStopGpio,a);} void setRightStop(bool a){setDigital(cart_config::kRightStopGpio,a);} void setLeftBrake(bool a){setDigital(cart_config::kLeftBrakeGpio,a);} void setRightBrake(bool a){setDigital(cart_config::kRightBrakeGpio,a);} void forceSafeOutputs(){setLeftPwm(0);setRightPwm(0);setLeftStop(true);setRightStop(true);setLeftBrake(true);setRightBrake(true);} bool estopActive(){int lvl=gpio_get_level(static_cast<gpio_num_t>(cart_config::kEstopGpio)); return cart_config::kEstopActiveLow?lvl==0:lvl!=0;} private: void setPwm(ledc_channel_t c,std::uint16_t d){ if(d>cart_config::kPwmMaxDuty)d=cart_config::kPwmMaxDuty; ledc_set_duty(LEDC_LOW_SPEED_MODE,c,d); ledc_update_duty(LEDC_LOW_SPEED_MODE,c);} void setDigital(int g,bool asserted){int lvl=(asserted^cart_config::kDigitalAssertedLevelLow)?1:0; gpio_set_level(static_cast<gpio_num_t>(g),lvl);} } hw;
-
-struct CalibrationState{ std::uint16_t left_duty=0,right_duty=0; bool stop=true,brake=true; std::uint32_t last_left=0,last_right=0;};
-CalibrationState g_cal; volatile std::uint32_t left_pulses=0,right_pulses=0;
-void IRAM_ATTR leftPulseIsr(void*){left_pulses++;}
-void IRAM_ATTR rightPulseIsr(void*){right_pulses++;}
-std::uint16_t clampCalibrationDuty(std::uint32_t duty){ return duty>cart_config::kCalibrationMaxDuty?cart_config::kCalibrationMaxDuty:static_cast<std::uint16_t>(duty);}
-void applyCalibrationOutputs(){ hw.setLeftPwm(g_cal.left_duty); hw.setRightPwm(g_cal.right_duty); hw.setLeftStop(g_cal.stop); hw.setRightStop(g_cal.stop); hw.setLeftBrake(g_cal.brake); hw.setRightBrake(g_cal.brake);}
-bool parseDuty(const char* s,std::uint16_t& duty){ if(!s||!*s)return false; for(const char* p=s;*p;++p){ if(*p<'0'||*p>'9')return false; } char* end=nullptr; unsigned long v=strtoul(s,&end,10); if(end==s||*end!='\0')return false; duty=clampCalibrationDuty(v); return true;}
-void printCalibrationStatus(std::uint32_t window_ms){ printf("CAL duty_left=%u duty_right=%u estop=%d brake=%d stop=%d left_pulses=%lu right_pulses=%lu window_ms=%lu\n",g_cal.left_duty,g_cal.right_duty,hw.estopActive()?1:0,g_cal.brake?1:0,g_cal.stop?1:0,static_cast<unsigned long>(left_pulses),static_cast<unsigned long>(right_pulses),static_cast<unsigned long>(window_ms));}
-void calibrationSafeStop(){ g_cal.left_duty=0; g_cal.right_duty=0; g_cal.stop=true; applyCalibrationOutputs();}
-void calibrationCommandTask(void*){ char line[64]; for(;;){ if(fgets(line,sizeof(line),stdin)==nullptr){ vTaskDelay(pdMS_TO_TICKS(10)); continue; } char* nl=strpbrk(line,"\r\n"); if(nl)*nl='\0'; char* cmd=strtok(line," "); char* arg=strtok(nullptr," "); char* extra=strtok(nullptr," "); bool ok=false; if(cmd&&!extra){ if(strcmp(cmd,"PWM")==0){ std::uint16_t d; ok=parseDuty(arg,d); if(ok){ if(d>0&&hw.estopActive()) ok=false; else {g_cal.left_duty=d; g_cal.right_duty=d; g_cal.stop=d==0; applyCalibrationOutputs();}} } else if(strcmp(cmd,"LEFT")==0){ std::uint16_t d; ok=parseDuty(arg,d); if(ok){ if(d>0&&hw.estopActive()) ok=false; else {g_cal.left_duty=d; g_cal.stop=(g_cal.left_duty==0&&g_cal.right_duty==0); applyCalibrationOutputs();}} } else if(strcmp(cmd,"RIGHT")==0){ std::uint16_t d; ok=parseDuty(arg,d); if(ok){ if(d>0&&hw.estopActive()) ok=false; else {g_cal.right_duty=d; g_cal.stop=(g_cal.left_duty==0&&g_cal.right_duty==0); applyCalibrationOutputs();}} } else if(strcmp(cmd,"STOP")==0&&!arg){ calibrationSafeStop(); ok=true; } else if(strcmp(cmd,"BRAKE")==0&&arg&&(strcmp(arg,"0")==0||strcmp(arg,"1")==0)){ g_cal.brake=strcmp(arg,"1")==0; if(g_cal.brake){g_cal.left_duty=0; g_cal.right_duty=0;} applyCalibrationOutputs(); ok=true; } else if(strcmp(cmd,"STATUS")==0&&!arg){ ok=true; } } if(!ok){ if(cmd&&(strcmp(cmd,"PWM")==0||strcmp(cmd,"LEFT")==0||strcmp(cmd,"RIGHT")==0||strcmp(cmd,"BRAKE")==0)) calibrationSafeStop(); printf("ERR\n"); } printCalibrationStatus(0); }}
-void calibrationReportTask(void*){ TickType_t wake=xTaskGetTickCount(); std::uint32_t period=cart_config::kCalibrationReportPeriodMs; for(;;){ if(hw.estopActive()&&(g_cal.left_duty||g_cal.right_duty)) calibrationSafeStop(); printCalibrationStatus(period); vTaskDelayUntil(&wake,pdMS_TO_TICKS(period)); }}
-bool initCalibrationPulseInputs(){ bool installed=false; if(cart_config::kLeftSpeedPulseGpio>=0||cart_config::kRightSpeedPulseGpio>=0){ if(gpio_install_isr_service(0)!=ESP_OK) return false; installed=true; } auto setup=[&](int gpio,gpio_isr_t isr){ if(gpio<0)return true; gpio_config_t c{}; c.pin_bit_mask=1ULL<<gpio; c.mode=GPIO_MODE_INPUT; c.pull_up_en=GPIO_PULLUP_ENABLE; c.pull_down_en=GPIO_PULLDOWN_DISABLE; c.intr_type=GPIO_INTR_POSEDGE; if(gpio_config(&c)!=ESP_OK)return false; return gpio_isr_handler_add(static_cast<gpio_num_t>(gpio),isr,nullptr)==ESP_OK;}; return (!installed)|| (setup(cart_config::kLeftSpeedPulseGpio,leftPulseIsr)&&setup(cart_config::kRightSpeedPulseGpio,rightPulseIsr));}
-void startCalibrationMode(){ g_cal.left_duty=0; g_cal.right_duty=0; g_cal.stop=true; g_cal.brake=true; applyCalibrationOutputs(); if(!initCalibrationPulseInputs()){ hw.forceSafeOutputs(); return; } printf("CALIBRATION_MODE boot_policy=pwm_zero_stop_asserted_brake_applied malformed_policy=motion_commands_safe_stop_then_ERR_status_only_unchanged\n"); xTaskCreate(calibrationCommandTask,"cal_cmd",4096,nullptr,5,nullptr); xTaskCreate(calibrationReportTask,"cal_report",4096,nullptr,4,nullptr);}
-
-void recvCb(const esp_now_recv_info_t* info,const uint8_t* data,int len){ if(!info||!data||len<0)return; RawRx item{}; std::memcpy(item.mac,info->src_addr,6); item.len=len>64?64:len; std::memcpy(item.bytes,data,item.len); item.rssi=info->rx_ctrl?info->rx_ctrl->rssi:0; item.at_ms=nowMs(); raw_rx++; if(xQueueSend(g_raw_q,&item,0)!=pdTRUE){ RawRx drop{}; xQueueReceive(g_raw_q,&drop,0); if(xQueueSend(g_raw_q,&item,0)!=pdTRUE) rx_overflow++; }}
-void packetTask(void*){ SessionTracker tracker; RawRx raw{}; for(;;){ if(xQueueReceive(g_raw_q,&raw,portMAX_DELAY)==pdTRUE){ ControlPacket p{}; if(std::memcmp(raw.mac,cart_config::kWearableMac.data(),6)!=0) continue; DecodeResult d=decodeControlPacket(raw.bytes,raw.len,p); if(d!=DecodeResult::Valid) continue; AcceptedCommand cmd{}; auto vr=tracker.consider(p.session_id,p.sequence,{static_cast<SpeedLevel>(p.desired_speed),static_cast<SteeringState>(p.desired_steering)},raw.at_ms,false,cmd); if(vr==ValidationResult::Valid){accepted++; xQueueOverwrite(g_cmd_q,&cmd);} } }}
-void motorTask(void*){
- MotorConfig config{};
- config.link_timeout_ms=1000;
- config.stopped_policy=StoppedPolicy::Pushable;
- config.standstill_velocity=5.0F;
- MotorLogic logic(config);
- AcceptedCommand cmd{};
- bool have=false;
- // The GPIO/PWM backend acknowledges the axis mode requested on the preceding
- // cycle.  An ODrive backend supplies these same fields from its telemetry.
- ODriveStatus status{{AxisState::Idle,true,0.0F},{AxisState::Idle,true,0.0F}};
- AxisState applied_state=AxisState::Idle;
- float measured_left=0.0F,measured_right=0.0F;
- TickType_t wake=xTaskGetTickCount();
- for(;;){
-  const auto now=nowMs();
-  bool newly_accepted=false;
-  AcceptedCommand incoming{};
-  if(xQueueReceive(g_cmd_q,&incoming,0)==pdTRUE){cmd=incoming;have=true;newly_accepted=true;}
-  const bool timed_out=have && now-cmd.received_at_ms>config.link_timeout_ms;
-  if(timed_out){timeouts++;have=false;}
-  MotorCommand desired{};
-  desired.newly_accepted=newly_accepted;
-  desired.emergency_stop=hw.estopActive();
-  desired.timed_out=timed_out;
-  desired.run=have && cmd.control.speed!=SpeedLevel::Stopped;
-  if(desired.run){
-   const auto targets=driveTargets(cmd.control);
-   const auto pwm=wheelPwmFromTargets(targets);
-   desired.left_velocity=static_cast<float>(pwm.left);
-   desired.right_velocity=static_cast<float>(pwm.right);
-  }
-  status.left.state=status.right.state=applied_state;
-  status.left.velocity=measured_left;
-  status.right.velocity=measured_right;
-  const MotorState before=logic.state();
-  const MotorOutput out=logic.update(now,desired,status);
-  if(logic.state()!=before){state_transitions++; if(logic.state()==MotorState::EmergencyStopped)estops++;}
-  applied_state=out.requested_axis_state;
-  measured_left=out.left_velocity;
-  measured_right=out.right_velocity;
-  if(logic.state()==MotorState::EmergencyStopped||logic.state()==MotorState::Fault){hw.forceSafeOutputs();}
-  else {
-   const bool idle=out.requested_axis_state==AxisState::Idle;
-   hw.setLeftStop(idle); hw.setRightStop(idle);
-   hw.setLeftBrake(false); hw.setRightBrake(false);
-   hw.setLeftPwm(idle?0:static_cast<std::uint16_t>(out.left_velocity));
-   hw.setRightPwm(idle?0:static_cast<std::uint16_t>(out.right_velocity));
-  }
-  vTaskDelayUntil(&wake,pdMS_TO_TICKS(5));
- }
+namespace {
+struct RawRx {
+  std::uint8_t mac[6];
+  std::uint8_t bytes[kControlPacketSize];
+  int length;
+  std::uint64_t received_at_ms;
+};
+QueueHandle_t g_raw_queue{}, g_command_queue{};
+cart::ODriveUart g_odrive;
+std::atomic<bool> g_recovery_requested{false};
+std::uint64_t nowMs() { return esp_timer_get_time() / 1000ULL; }
+bool estopActive() {
+  const int level =
+      gpio_get_level(static_cast<gpio_num_t>(cart_config::kEstopSenseGpio));
+  return cart_config::kEstopActiveLow ? level == 0 : level != 0;
 }
-bool initNow(){ ESP_ERROR_CHECK(nvs_flash_init()); ESP_ERROR_CHECK(esp_netif_init()); ESP_ERROR_CHECK(esp_event_loop_create_default()); wifi_init_config_t cfg=WIFI_INIT_CONFIG_DEFAULT(); ESP_ERROR_CHECK(esp_wifi_init(&cfg)); ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_STA)); ESP_ERROR_CHECK(esp_wifi_start()); if(esp_now_init()!=ESP_OK)return false; esp_now_set_pmk(cart_config::kPmk.data()); esp_now_register_recv_cb(recvCb); esp_now_peer_info_t peer{}; std::memcpy(peer.peer_addr,cart_config::kWearableMac.data(),6); peer.ifidx=WIFI_IF_STA; peer.encrypt=true; std::memcpy(peer.lmk,cart_config::kLmk.data(),16); return esp_now_add_peer(&peer)==ESP_OK; }}
-extern "C" void app_main(){ if(!hw.initialize()){hw.forceSafeOutputs(); return;} if(cart_config::kCalibrationModeEnabled){ startCalibrationMode(); return; } g_raw_q=xQueueCreate(8,sizeof(RawRx)); g_cmd_q=xQueueCreate(1,sizeof(AcceptedCommand)); if(!g_raw_q||!g_cmd_q||!initNow()){hw.forceSafeOutputs(); return;} xTaskCreate(packetTask,"packet",4096,nullptr,5,nullptr); xTaskCreate(motorTask,"motor",4096,nullptr,6,nullptr); }
+void receiveCallback(const esp_now_recv_info_t *info, const std::uint8_t *data,
+                     int length) {
+  if (!info || !data || length < 0)
+    return;
+  RawRx r{};
+  std::memcpy(r.mac, info->src_addr, 6);
+  r.length = length;
+  if (length == static_cast<int>(kControlPacketSize))
+    std::memcpy(r.bytes, data, kControlPacketSize);
+  r.received_at_ms = nowMs();
+  if (xQueueSend(g_raw_queue, &r, 0) != pdTRUE) {
+    RawRx discarded{};
+    xQueueReceive(g_raw_queue, &discarded, 0);
+    xQueueSend(g_raw_queue, &r, 0);
+  }
+}
+void packetTask(void *) {
+  SessionTracker sessions;
+  RawRx raw{};
+  std::uint64_t last_accepted = 0;
+  for (;;) {
+    if (xQueueReceive(g_raw_queue, &raw, portMAX_DELAY) != pdTRUE)
+      continue;
+    if (std::memcmp(raw.mac, cart_config::kWearableMac.data(), 6) != 0)
+      continue;
+    ControlPacket p{};
+    if (decodeControlPacket(raw.bytes, static_cast<std::size_t>(raw.length),
+                            p) != DecodeResult::Valid)
+      continue;
+    AcceptedCommand accepted{};
+    const bool timed_out =
+        last_accepted != 0 && raw.received_at_ms - last_accepted >
+                                  cart_config::motorPolicy().link_timeout_ms;
+    if (sessions.consider(p.session_id, p.sequence, p.control,
+                          raw.received_at_ms, timed_out,
+                          accepted) == ValidationResult::Valid) {
+      last_accepted = raw.received_at_ms;
+      xQueueOverwrite(g_command_queue, &accepted);
+    }
+  }
+}
+MotorFeedback convert(const cart::ODriveStatus &s) {
+  auto cv = [](const cart::AxisStatus &a) {
+    AxisFeedback o{};
+    o.valid = a.valid;
+    o.state = static_cast<AxisState>(a.axis_state);
+    o.errors =
+        a.axis_error | a.motor_error | a.encoder_error | a.controller_error;
+    o.velocity = static_cast<VelocityMilliTurnsPerSecond>(
+        a.measured_velocity_turns_per_second * 1000.0F);
+    o.current_milliamps = static_cast<std::int32_t>(a.current_amps * 1000.0F);
+    o.updated_at_ms = a.updated_at_ms;
+    return o;
+  };
+  MotorFeedback f{};
+  f.uart_healthy = s.uart_healthy;
+  f.left = cv(s.axis0);
+  f.right = cv(s.axis1);
+  f.bus_millivolts = static_cast<std::int32_t>(s.dc_bus_voltage * 1000.0F);
+  f.bus_updated_at_ms = s.bus_voltage_updated_at_ms;
+  return f;
+}
+void motorTask(void *) {
+  MotorPolicy policy(cart_config::motorPolicy());
+  AcceptedCommand accepted{};
+  bool have = false;
+  std::uint32_t generation = 0;
+  TickType_t wake = xTaskGetTickCount();
+  for (;;) {
+    AcceptedCommand incoming{};
+    if (xQueueReceive(g_command_queue, &incoming, 0) == pdTRUE) {
+      accepted = incoming;
+      have = true;
+    }
+    cart::ODriveStatus status{};
+    g_odrive.latestStatus(status);
+    PolicyInput in{};
+    in.now_ms = nowMs();
+    in.estop_active = estopActive();
+    in.have_command = have;
+    in.command = accepted.control;
+    in.command_at_ms = accepted.received_at_ms;
+    in.recovery_requested = accepted.control.mode == OperatingMode::Recover ||
+                            g_recovery_requested.exchange(false);
+    in.feedback = convert(status);
+    auto out = policy.update(in);
+    cart::ODriveCommand command{};
+    command.created_at_ms = in.now_ms;
+    command.generation = ++generation;
+    command.feed_watchdogs = out.action.feed_watchdogs;
+    if (out.action.clear_errors)
+      command.kind = cart::ODriveActionKind::ClearErrors;
+    else if (out.action.request_idle)
+      command.kind = cart::ODriveActionKind::Idle;
+    else if (out.action.request_closed_loop &&
+             out.action.targets.left_millturns_per_second == 0 &&
+             out.action.targets.right_millturns_per_second == 0 &&
+             policy.state() == MotorState::EnablingClosedLoop)
+      command.kind = cart::ODriveActionKind::ClosedLoop;
+    else {
+      command.kind = cart::ODriveActionKind::Velocity;
+      command.targets = out.action.targets;
+    }
+    g_odrive.submit(command);
+    vTaskDelayUntil(&wake, pdMS_TO_TICKS(5));
+  }
+}
+
+bool parseCommissioningVelocity(const char *text,
+                                VelocityMilliTurnsPerSecond &out) {
+  if (!text || !*text)
+    return false;
+  char *end = nullptr;
+  const long value = std::strtol(text, &end, 10);
+  if (end == text || *end != '\0' ||
+      value < -cart_config::kCommissioningMaxVelocity ||
+      value > cart_config::kCommissioningMaxVelocity)
+    return false;
+  out = static_cast<VelocityMilliTurnsPerSecond>(value);
+  return true;
+}
+void commissioningTask(void *) {
+  char line[96];
+  std::uint32_t generation = 0;
+  std::uint64_t lease_at = 0;
+  for (;;) {
+    if (std::fgets(line, sizeof(line), stdin)) {
+      char *newline = std::strpbrk(line, "\r\n");
+      if (newline)
+        *newline = '\0';
+      char *name = std::strtok(line, " ");
+      char *a = std::strtok(nullptr, " ");
+      char *b = std::strtok(nullptr, " ");
+      char *extra = std::strtok(nullptr, " ");
+      cart::ODriveCommand command{};
+      command.created_at_ms = nowMs();
+      command.generation = ++generation;
+      bool ok = name && !extra;
+      if (ok && std::strcmp(name, "IDLE") == 0 && !a)
+        command.kind = cart::ODriveActionKind::Idle;
+      else if (ok && std::strcmp(name, "ENABLE") == 0 && !a)
+        command.kind = cart::ODriveActionKind::ClosedLoop;
+      else if (ok && std::strcmp(name, "STOP") == 0 && !a) {
+        command.kind = cart::ODriveActionKind::Velocity;
+        lease_at = 0;
+      } else if (ok && std::strcmp(name, "RECOVER") == 0 && !a) {
+        command.kind = cart::ODriveActionKind::ClearErrors;
+        lease_at = 0;
+      } else if (ok && std::strcmp(name, "VELOCITY") == 0 && a && b) {
+        ok = parseCommissioningVelocity(
+                 a, command.targets.left_millturns_per_second) &&
+             parseCommissioningVelocity(
+                 b, command.targets.right_millturns_per_second);
+        command.kind = cart::ODriveActionKind::Velocity;
+        if (ok)
+          lease_at = command.created_at_ms;
+      } else if (ok && std::strcmp(name, "STATUS") == 0 && !a) {
+        cart::ODriveStatus status{};
+        g_odrive.latestStatus(status);
+        std::printf("ODRIVE uart=%d axis0_state=%lu axis1_state=%lu "
+                    "axis0_vel=%.3f axis1_vel=%.3f vbus=%.3f\n",
+                    status.uart_healthy ? 1 : 0,
+                    static_cast<unsigned long>(status.axis0.axis_state),
+                    static_cast<unsigned long>(status.axis1.axis_state),
+                    static_cast<double>(
+                        status.axis0.measured_velocity_turns_per_second),
+                    static_cast<double>(
+                        status.axis1.measured_velocity_turns_per_second),
+                    static_cast<double>(status.dc_bus_voltage));
+        continue;
+      } else
+        ok = false;
+      if (ok)
+        g_odrive.submit(command);
+      else
+        std::printf("ERR\n");
+    }
+    if (lease_at && nowMs() - lease_at > cart_config::kCommissioningLeaseMs) {
+      cart::ODriveCommand stop{};
+      stop.kind = cart::ODriveActionKind::Velocity;
+      stop.created_at_ms = nowMs();
+      stop.generation = ++generation;
+      g_odrive.submit(stop);
+      lease_at = 0;
+    }
+    vTaskDelay(pdMS_TO_TICKS(10));
+  }
+}
+bool initNow() {
+  ESP_ERROR_CHECK(nvs_flash_init());
+  ESP_ERROR_CHECK(esp_netif_init());
+  ESP_ERROR_CHECK(esp_event_loop_create_default());
+  wifi_init_config_t c = WIFI_INIT_CONFIG_DEFAULT();
+  ESP_ERROR_CHECK(esp_wifi_init(&c));
+  ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_STA));
+  ESP_ERROR_CHECK(esp_wifi_start());
+  if (esp_now_init() != ESP_OK)
+    return false;
+  ESP_ERROR_CHECK(esp_now_set_pmk(cart_config::kPmk.data()));
+  ESP_ERROR_CHECK(esp_now_register_recv_cb(receiveCallback));
+  esp_now_peer_info_t p{};
+  std::memcpy(p.peer_addr, cart_config::kWearableMac.data(), 6);
+  p.ifidx = WIFI_IF_STA;
+  p.encrypt = true;
+  std::memcpy(p.lmk, cart_config::kLmk.data(), 16);
+  return esp_now_add_peer(&p) == ESP_OK;
+}
+} // namespace
+extern "C" void app_main() {
+  gpio_set_direction(static_cast<gpio_num_t>(cart_config::kEstopSenseGpio),
+                     GPIO_MODE_INPUT);
+  gpio_set_pull_mode(static_cast<gpio_num_t>(cart_config::kEstopSenseGpio),
+                     cart_config::kEstopActiveLow ? GPIO_PULLUP_ONLY
+                                                  : GPIO_PULLDOWN_ONLY);
+  g_raw_queue = xQueueCreate(8, sizeof(RawRx));
+  g_command_queue = xQueueCreate(1, sizeof(AcceptedCommand));
+  if (!g_raw_queue || !g_command_queue || !g_odrive.initialize())
+    return;
+  if (cart_config::kCommissioningModeEnabled) {
+    xTaskCreate(commissioningTask, "commissioning", 6144, nullptr, 6, nullptr);
+    return;
+  }
+  if (!initNow())
+    return;
+  xTaskCreate(packetTask, "packet", 4096, nullptr, 5, nullptr);
+  xTaskCreate(motorTask, "motor_policy", 6144, nullptr, 6, nullptr);
+}

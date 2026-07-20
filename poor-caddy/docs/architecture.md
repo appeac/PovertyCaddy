@@ -1,21 +1,24 @@
 # Architecture
 
-PoorCaddy separates hardware configuration, radio transport, packet protocol, validation/session logic, motor state control, ramping, and GPIO/PWM output.
+## Boundaries and data flow
 
-## Wearable
+The wearable samples and debounces five active-low buttons at 200 Hz, resolves conservative operator intent (including manual-push, hold, and the stopped recovery chord), and publishes a complete version-2 packet every 50 ms. The receive callback on the cart only bounds and copies bytes. A packet task validates the trusted MAC, explicit wire format, CRC, session, and wrap-safe sequence before overwriting a one-element accepted-command queue.
 
-- `main/wearable_config.hpp`: placeholder GPIOs, MACs, PMK, LMK.
-- Button task: 5 ms `vTaskDelayUntil()`, debounced buttons, `resolveButtons()`, one-item queue, `xQueueOverwrite()`.
-- Transmit task: 50 ms `vTaskDelayUntil()`, random 32-bit session ID from `esp_random()`, sequence starts at zero and increments per send attempt, sends full packet every period.
+The cart motor task is the sole owner of `MotorPolicy`. It combines the newest command, monotonic timestamps, the observed e-stop input, and an atomic-style ODrive status snapshot. It emits typed actions. `ODriveUart` is the only task permitted to touch the dedicated ODrive UART; its velocity queue is length one, so the latest generation replaces stale motion intent. It emits both axis commands consecutively and publishes only a complete status snapshot.
 
-## Shared component
+Shared protocol, target mapping, ramps, and motor policy contain no ESP-IDF calls and run in host tests. `odrive_protocol` is also host-testable. `odrive_uart` contains the ESP-IDF adapter and firmware-specific scheduling.
 
-`components/poor_caddy_protocol` is ESP-IDF independent where practical. It includes explicit `SpeedLevel` and `SteeringState` enums, fixed byte protocol encoding, CRC-32, sequence classification with half-range modular assumption, session/startup confirmation, drive target selection, and deterministic fixed-remainder ramps.
+## Queue policy
 
-Wire layout is little-endian explicit bytes: magic at 0, session at 4, sequence at 8, version/speed/steering/flags at 12-15, reserved zero bytes at 16-19, CRC-32 at 20-23 over bytes 0-19.
+- Raw ESP-NOW: bounded length eight; when full, discard the oldest sample.
+- Accepted command: length one, overwrite, latest valid command wins.
+- ODrive action: length one, overwrite, generation and age checked again by the UART owner.
+- Telemetry: mutex-protected newest complete snapshot; consumers never drain a history of stale readings.
 
-## Cart
+Safety events are recomputed each 5 ms policy cycle rather than queued behind motion. The physical e-stop remains independent of all queues.
 
-- ESP-NOW receive callback copies sender MAC and bounded bytes to an ordinary length-8 queue without blocking.
-- Packet task validates sender, length, magic, version, CRC, enum ranges, session, and sequence before publishing `AcceptedCommand` to a one-item overwrite queue.
-- Motor task runs at 200 Hz, checks e-stop and timeout each cycle, updates state machine and ramps using measured elapsed milliseconds, and writes outputs through `MotorHw`.
+## Watchdog layers
+
+ESP-NOW freshness triggers a controlled deceleration while UART and feedback remain healthy. The ODrive communication watchdog handles a different failure: loss or wedging of the ESP32/UART path. It is fed only for healthy closed-loop states with fresh telemetry. The hardware e-stop is a third independent layer and must remove or inhibit torque without firmware cooperation.
+
+ASCII telemetry is intentionally slower than motion updates. Essential telemetry must never be made so verbose that it starves setpoints or watchdog service.

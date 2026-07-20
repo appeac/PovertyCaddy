@@ -1,33 +1,64 @@
 #include "poor_caddy_protocol/control.hpp"
 #include <algorithm>
-
+#include <cstdint>
 namespace poor_caddy {
-SpeedLevel speedUp(SpeedLevel current) {
-    switch (current) { case SpeedLevel::Stopped: return SpeedLevel::Forward1; case SpeedLevel::Forward1: return SpeedLevel::Forward2; case SpeedLevel::Forward2: return SpeedLevel::Forward3; case SpeedLevel::Forward3: return SpeedLevel::Forward3; }
-    return SpeedLevel::Stopped;
+SpeedLevel speedUp(SpeedLevel v) {
+  return v == SpeedLevel::Stopped    ? SpeedLevel::Forward1
+         : v == SpeedLevel::Forward1 ? SpeedLevel::Forward2
+                                     : SpeedLevel::Forward3;
 }
-SpeedLevel speedDown(SpeedLevel current) {
-    switch (current) { case SpeedLevel::Forward3: return SpeedLevel::Forward2; case SpeedLevel::Forward2: return SpeedLevel::Forward1; case SpeedLevel::Forward1: return SpeedLevel::Stopped; case SpeedLevel::Stopped: return SpeedLevel::Stopped; }
-    return SpeedLevel::Stopped;
+SpeedLevel speedDown(SpeedLevel v) {
+  return v == SpeedLevel::Forward3   ? SpeedLevel::Forward2
+         : v == SpeedLevel::Forward2 ? SpeedLevel::Forward1
+                                     : SpeedLevel::Stopped;
 }
-ControlState resolveButtons(ControlState previous, ButtonInputs inputs) {
-    ControlState next = previous;
-    if (inputs.stop_held || (inputs.speed_up_pressed && inputs.speed_down_pressed)) next.speed = SpeedLevel::Stopped;
-    else if (inputs.speed_up_pressed) next.speed = speedUp(next.speed);
-    else if (inputs.speed_down_pressed) next.speed = speedDown(next.speed);
-    if (next.speed == SpeedLevel::Stopped || (inputs.left_held && inputs.right_held) || (!inputs.left_held && !inputs.right_held)) next.steering = SteeringState::Straight;
-    else if (inputs.left_held) next.steering = SteeringState::Left;
-    else next.steering = SteeringState::Right;
-    return next;
+ControlState resolveButtons(ControlState p, ButtonInputs i) {
+  if (i.speed_up_pressed && i.speed_down_pressed) {
+    p.speed = SpeedLevel::Stopped;
+    p.mode = OperatingMode::Recover;
+  } else if (i.stop_held) {
+    p.speed = SpeedLevel::Stopped;
+    p.mode = (i.left_held && !i.right_held) ? OperatingMode::Hold
+                                            : OperatingMode::ManualPush;
+  } else {
+    if (i.speed_up_pressed)
+      p.speed = speedUp(p.speed);
+    else if (i.speed_down_pressed)
+      p.speed = speedDown(p.speed);
+    if (p.speed != SpeedLevel::Stopped)
+      p.mode = OperatingMode::Drive;
+  }
+  if (p.speed == SpeedLevel::Stopped || (i.left_held == i.right_held))
+    p.steering = SteeringState::Straight;
+  else
+    p.steering = i.left_held ? SteeringState::Left : SteeringState::Right;
+  return p;
 }
-DriveTargets driveTargets(ControlState state) {
-    switch (state.speed) {
-    case SpeedLevel::Forward1: return {250, state.steering == SteeringState::Left ? static_cast<std::uint16_t>(150) : static_cast<std::uint16_t>(0), state.steering == SteeringState::Right ? static_cast<std::uint16_t>(150) : static_cast<std::uint16_t>(0)};
-    case SpeedLevel::Forward2: return {500, state.steering == SteeringState::Left ? static_cast<std::uint16_t>(250) : static_cast<std::uint16_t>(0), state.steering == SteeringState::Right ? static_cast<std::uint16_t>(250) : static_cast<std::uint16_t>(0)};
-    case SpeedLevel::Forward3: return {750, state.steering == SteeringState::Left ? static_cast<std::uint16_t>(150) : static_cast<std::uint16_t>(0), state.steering == SteeringState::Right ? static_cast<std::uint16_t>(150) : static_cast<std::uint16_t>(0)};
-    case SpeedLevel::Stopped: return {0, 0, 0};
-    }
-    return {0,0,0};
+static VelocityMilliTurnsPerSecond clampScale(VelocityMilliTurnsPerSecond v,
+                                              std::uint16_t scale,
+                                              std::int8_t sign,
+                                              VelocityMilliTurnsPerSecond max) {
+  std::int64_t x = static_cast<std::int64_t>(v) * scale / 1000;
+  x = std::min<std::int64_t>(x, max);
+  return static_cast<VelocityMilliTurnsPerSecond>(x * (sign < 0 ? -1 : 1));
 }
-WheelPwm wheelPwmFromTargets(DriveTargets t) { return {static_cast<std::uint16_t>(t.base_pwm > t.left_reduction ? t.base_pwm - t.left_reduction : 0), static_cast<std::uint16_t>(t.base_pwm > t.right_reduction ? t.base_pwm - t.right_reduction : 0)}; }
+WheelVelocityTargets wheelVelocityTargets(ControlState s,
+                                          const DriveConfig &c) {
+  VelocityMilliTurnsPerSecond base =
+      s.speed == SpeedLevel::Forward1   ? c.speed1
+      : s.speed == SpeedLevel::Forward2 ? c.speed2
+      : s.speed == SpeedLevel::Forward3 ? c.speed3
+                                        : 0;
+  base =
+      std::clamp(base, static_cast<VelocityMilliTurnsPerSecond>(0), c.maximum);
+  auto l = base, r = base;
+  if (s.steering == SteeringState::Left)
+    l = static_cast<VelocityMilliTurnsPerSecond>(
+        static_cast<std::int64_t>(base) * c.left_turn_inner_permille / 1000);
+  if (s.steering == SteeringState::Right)
+    r = static_cast<VelocityMilliTurnsPerSecond>(
+        static_cast<std::int64_t>(base) * c.right_turn_inner_permille / 1000);
+  return {clampScale(l, c.left_scale_permille, c.left_sign, c.maximum),
+          clampScale(r, c.right_scale_permille, c.right_sign, c.maximum)};
 }
+} // namespace poor_caddy

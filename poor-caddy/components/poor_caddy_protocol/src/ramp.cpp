@@ -1,20 +1,28 @@
 #include "poor_caddy_protocol/ramp.hpp"
 #include <algorithm>
+#include <cstdint>
 namespace poor_caddy {
-std::uint16_t Ramp::update(std::uint16_t target, std::uint32_t elapsed_ms) {
-    const std::uint32_t clamped = std::min(elapsed_ms, 20U);
-    if (value_ == target) { rem_ = 0; return value_; }
-    const std::uint64_t scaled = static_cast<std::uint64_t>(rate_) * clamped + rem_;
-    const std::uint32_t step = static_cast<std::uint32_t>(scaled / 1000U);
-    rem_ = static_cast<std::uint32_t>(scaled % 1000U);
-    if (step == 0U) return value_;
-    if (target > value_) {
-        value_ = static_cast<std::uint16_t>(std::min<std::uint32_t>(target, static_cast<std::uint32_t>(value_) + step));
-    } else {
-        const std::uint32_t delta = static_cast<std::uint32_t>(value_ - target);
-        value_ = static_cast<std::uint16_t>((step >= delta) ? target : static_cast<std::uint16_t>(value_ - step));
-    }
-    if (value_ == target) rem_ = 0;
-    return value_;
+VelocityMilliTurnsPerSecond
+VelocityRamp::update(VelocityMilliTurnsPerSecond target, std::uint32_t ms,
+                     std::uint32_t accel, std::uint32_t decel) {
+  ms = std::min(ms, 50U);
+  const bool slowing = (value_ > 0 && target < value_) ||
+                       (value_ < 0 && target > value_) || target == 0;
+  const auto rate = slowing ? decel : accel;
+  const std::uint64_t scaled =
+      static_cast<std::uint64_t>(rate) * ms + remainder_;
+  const std::int64_t step = static_cast<std::int64_t>(scaled / 1000U);
+  remainder_ = static_cast<std::uint32_t>(scaled % 1000U);
+  if (target > value_)
+    value_ = static_cast<VelocityMilliTurnsPerSecond>(std::min<std::int64_t>(
+        target, static_cast<std::int64_t>(value_) + step));
+  else if (target < value_)
+    value_ = static_cast<VelocityMilliTurnsPerSecond>(std::max<std::int64_t>(
+        target, static_cast<std::int64_t>(value_) - step));
+  else
+    remainder_ = 0;
+  if (value_ == target)
+    remainder_ = 0;
+  return value_;
 }
-}
+} // namespace poor_caddy
