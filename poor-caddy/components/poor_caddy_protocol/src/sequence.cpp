@@ -1,2 +1,16 @@
 #include "poor_caddy_protocol/sequence.hpp"
-namespace poor_caddy { SequenceClass classifySequence(bool have, std::uint32_t last, std::uint32_t cand){ if(!have) return SequenceClass::First; if(cand==last) return SequenceClass::Duplicate; const auto diff=static_cast<std::int32_t>(cand-last); return diff>0?SequenceClass::Newer:SequenceClass::Old; } std::uint32_t missingBetween(std::uint32_t last,std::uint32_t cand){ std::uint32_t d=cand-last; return d>0?d-1U:0U; } }
+namespace poor_caddy {
+SequenceClass classifySequence(bool have, std::uint32_t last,
+                               std::uint32_t cand) {
+  if (!have)
+    return SequenceClass::First;
+  if (cand == last)
+    return SequenceClass::Duplicate;
+  const auto diff = static_cast<std::int32_t>(cand - last);
+  return diff > 0 ? SequenceClass::Newer : SequenceClass::Old;
+}
+std::uint32_t missingBetween(std::uint32_t last, std::uint32_t cand) {
+  std::uint32_t d = cand - last;
+  return d > 0 ? d - 1U : 0U;
+}
+} // namespace poor_caddy

@@ -1,13 +1,11 @@
-# PoorCaddy wearable
+# Wearable firmware
 
-The wearable owns the desired `ControlState` and transmits the complete current state at 20 Hz. Five active-low buttons use ESP32-C6 internal pull-ups and are sampled every 5 ms with about 25 ms debounce.
+The ESP32-C6 wearable debounces five active-low buttons, resolves Stop conservatively, and sends a full encrypted version-2 ESP-NOW packet every 50 ms with a random boot session and advancing sequence.
 
-| Function | Placeholder GPIO | Notes |
-|---|---:|---|
-| Speed Up | 2 | Verify against board flash/USB/JTAG/bootstrap pins |
-| Speed Down | 3 | Verify before wiring |
-| Left | 4 | Held steering input |
-| Right | 5 | Held steering input |
-| Stop | 6 | Held stop input, priority over all controls |
+Replace GPIO/MAC/PMK/LMK placeholders in `main/wearable_config.hpp`. Powered reverse is deliberately unavailable.
 
-Edit `main/wearable_config.hpp` before connecting hardware. Speed buttons are one-shot press events. Stop and steering are held states. Speed Up + Speed Down latches Stopped. Left + Right resolves to Straight.
+## Stop-mode gestures
+
+- Stop alone requests a controlled stop followed by manual-push idle.
+- Stop plus Left requests a controlled stop followed by zero-velocity hold.
+- A simultaneous Speed Up and Speed Down press requests recovery while remaining stopped; this is the deliberate recovery chord and never directly commands motion.

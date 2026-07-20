@@ -1,3 +1,43 @@
 #include "poor_caddy_protocol/session_tracker.hpp"
 #include "poor_caddy_protocol/sequence.hpp"
-namespace poor_caddy { ValidationResult SessionTracker::consider(std::uint32_t sid,std::uint32_t seq,ControlState ctl,std::uint64_t now,bool timed,AcceptedCommand& out){ if(active_ && sid==sid_){ auto c=classifySequence(true,last_,seq); if(c==SequenceClass::Duplicate) return ValidationResult::DuplicateSequence; if(c==SequenceClass::Old) return ValidationResult::OldSequence; last_=seq; out={ctl,now,sid,seq}; return ValidationResult::Valid; } if(active_ && !timed) return ValidationResult::ConflictingSession; if(!candidate_ || cand_sid_!=sid){ candidate_=true; cand_sid_=sid; cand_last_=seq; cand_count_=1; return ValidationResult::ConflictingSession; } auto c=classifySequence(true,cand_last_,seq); if(c==SequenceClass::Duplicate) return ValidationResult::DuplicateSequence; if(c==SequenceClass::Old) return ValidationResult::OldSequence; cand_last_=seq; cand_count_++; if(cand_count_>=3){ active_=true; sid_=sid; last_=seq; candidate_=false; out={ctl,now,sid,seq}; return ValidationResult::Valid; } return ValidationResult::ConflictingSession; } }
+namespace poor_caddy {
+ValidationResult SessionTracker::consider(std::uint32_t sid, std::uint32_t seq,
+                                          ControlState ctl, std::uint64_t now,
+                                          bool timed, AcceptedCommand &out) {
+  if (active_ && sid == sid_) {
+    auto c = classifySequence(true, last_, seq);
+    if (c == SequenceClass::Duplicate)
+      return ValidationResult::DuplicateSequence;
+    if (c == SequenceClass::Old)
+      return ValidationResult::OldSequence;
+    last_ = seq;
+    out = {ctl, now, sid, seq};
+    return ValidationResult::Valid;
+  }
+  if (active_ && !timed)
+    return ValidationResult::ConflictingSession;
+  if (!candidate_ || cand_sid_ != sid) {
+    candidate_ = true;
+    cand_sid_ = sid;
+    cand_last_ = seq;
+    cand_count_ = 1;
+    return ValidationResult::ConflictingSession;
+  }
+  auto c = classifySequence(true, cand_last_, seq);
+  if (c == SequenceClass::Duplicate)
+    return ValidationResult::DuplicateSequence;
+  if (c == SequenceClass::Old)
+    return ValidationResult::OldSequence;
+  cand_last_ = seq;
+  cand_count_++;
+  if (cand_count_ >= 3) {
+    active_ = true;
+    sid_ = sid;
+    last_ = seq;
+    candidate_ = false;
+    out = {ctl, now, sid, seq};
+    return ValidationResult::Valid;
+  }
+  return ValidationResult::ConflictingSession;
+}
+} // namespace poor_caddy

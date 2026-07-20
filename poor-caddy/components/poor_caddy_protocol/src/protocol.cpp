@@ -1,8 +1,53 @@
 #include "poor_caddy_protocol/protocol.hpp"
-#include <cstring>
 namespace poor_caddy {
-static void put32(PacketBytes& b, std::size_t o, std::uint32_t v){ b[o]=v&0xffU; b[o+1]=(v>>8)&0xffU; b[o+2]=(v>>16)&0xffU; b[o+3]=(v>>24)&0xffU; }
-static std::uint32_t get32(const std::uint8_t* b, std::size_t o){ return static_cast<std::uint32_t>(b[o]) | (static_cast<std::uint32_t>(b[o+1])<<8) | (static_cast<std::uint32_t>(b[o+2])<<16) | (static_cast<std::uint32_t>(b[o+3])<<24); }
-PacketBytes encodeControlPacket(std::uint32_t sid, std::uint32_t seq, ControlState s, std::uint8_t flags){ PacketBytes b{}; put32(b,0,kProtocolMagic); put32(b,4,sid); put32(b,8,seq); b[12]=kProtocolVersion; b[13]=static_cast<std::uint8_t>(s.speed); b[14]=static_cast<std::uint8_t>(s.steering); b[15]=flags; put32(b,16,0); put32(b,20,crc32(b.data(),20)); return b; }
-DecodeResult decodeControlPacket(const std::uint8_t* d, std::size_t len, ControlPacket& out){ if(d==nullptr || len!=kControlPacketSize) return DecodeResult::WrongLength; out.magic=get32(d,0); if(out.magic!=kProtocolMagic) return DecodeResult::WrongMagic; out.session_id=get32(d,4); out.sequence=get32(d,8); out.protocol_version=d[12]; if(out.protocol_version!=kProtocolVersion) return DecodeResult::WrongVersion; out.desired_speed=d[13]; out.desired_steering=d[14]; out.flags=d[15]; out.crc32=get32(d,20); if(crc32(d,20)!=out.crc32) return DecodeResult::BadCrc; if(!isValidSpeed(out.desired_speed)) return DecodeResult::InvalidSpeed; if(!isValidSteering(out.desired_steering)) return DecodeResult::InvalidSteering; return DecodeResult::Valid; }
+static void put32(PacketBytes &b, std::size_t o, std::uint32_t v) {
+  for (int i = 0; i < 4; i++)
+    b[o + i] = static_cast<std::uint8_t>(v >> (8 * i));
 }
+static std::uint32_t get32(const std::uint8_t *b, std::size_t o) {
+  return static_cast<std::uint32_t>(b[o]) |
+         (static_cast<std::uint32_t>(b[o + 1]) << 8) |
+         (static_cast<std::uint32_t>(b[o + 2]) << 16) |
+         (static_cast<std::uint32_t>(b[o + 3]) << 24);
+}
+PacketBytes encodeControlPacket(std::uint32_t sid, std::uint32_t seq,
+                                ControlState s, std::uint8_t flags) {
+  PacketBytes b{};
+  put32(b, 0, kProtocolMagic);
+  put32(b, 4, sid);
+  put32(b, 8, seq);
+  b[12] = kProtocolVersion;
+  b[13] = static_cast<std::uint8_t>(s.speed);
+  b[14] = static_cast<std::uint8_t>(s.steering);
+  b[15] = static_cast<std::uint8_t>(s.mode);
+  b[16] = flags;
+  put32(b, 20, crc32(b.data(), 20));
+  return b;
+}
+DecodeResult decodeControlPacket(const std::uint8_t *d, std::size_t n,
+                                 ControlPacket &p) {
+  if (!d || n != kControlPacketSize)
+    return DecodeResult::WrongLength;
+  if (get32(d, 0) != kProtocolMagic)
+    return DecodeResult::WrongMagic;
+  if (d[12] != kProtocolVersion)
+    return DecodeResult::WrongVersion;
+  if (crc32(d, 20) != get32(d, 20))
+    return DecodeResult::BadCrc;
+  if (!isValidSpeed(d[13]))
+    return DecodeResult::InvalidSpeed;
+  if (!isValidSteering(d[14]))
+    return DecodeResult::InvalidSteering;
+  if (!isValidMode(d[15]))
+    return DecodeResult::InvalidMode;
+  if (d[17] || d[18] || d[19])
+    return DecodeResult::ReservedNonzero;
+  p.session_id = get32(d, 4);
+  p.sequence = get32(d, 8);
+  p.control = {static_cast<SpeedLevel>(d[13]),
+               static_cast<SteeringState>(d[14]),
+               static_cast<OperatingMode>(d[15])};
+  p.flags = d[16];
+  return DecodeResult::Valid;
+}
+} // namespace poor_caddy
