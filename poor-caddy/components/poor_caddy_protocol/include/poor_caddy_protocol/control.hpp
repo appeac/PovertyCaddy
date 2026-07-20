@@ -1,4 +1,5 @@
 #pragma once
+#include <array>
 #include <cstdint>
 
 namespace poor_caddy {
@@ -16,8 +17,21 @@ SpeedLevel speedDown(SpeedLevel current);
 struct ButtonInputs { bool speed_up_pressed; bool speed_down_pressed; bool left_held; bool right_held; bool stop_held; };
 ControlState resolveButtons(ControlState previous, ButtonInputs inputs);
 
-struct DriveTargets { std::uint16_t base_pwm; std::uint16_t left_reduction; std::uint16_t right_reduction; };
-struct WheelPwm { std::uint16_t left; std::uint16_t right; };
-DriveTargets driveTargets(ControlState state);
-WheelPwm wheelPwmFromTargets(DriveTargets targets);
+using MilliTurnsPerSecond = std::int32_t;
+
+struct DriveVelocityConfig {
+    std::array<MilliTurnsPerSecond, 3> forward_speeds;
+    // Inside-wheel speed in thousandths of outside-wheel speed.
+    std::array<std::uint16_t, 3> steering_ratios_milli;
+    std::int8_t left_direction_sign;
+    std::int8_t right_direction_sign;
+    MilliTurnsPerSecond maximum_velocity;
+};
+
+struct WheelVelocityTargets {
+    MilliTurnsPerSecond left;
+    MilliTurnsPerSecond right;
+};
+
+WheelVelocityTargets driveTargets(ControlState state, const DriveVelocityConfig& config);
 }

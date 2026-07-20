@@ -1,5 +1,6 @@
 #include "poor_caddy_protocol/control.hpp"
 #include <algorithm>
+#include <cstddef>
 
 namespace poor_caddy {
 SpeedLevel speedUp(SpeedLevel current) {
@@ -20,14 +21,23 @@ ControlState resolveButtons(ControlState previous, ButtonInputs inputs) {
     else next.steering = SteeringState::Right;
     return next;
 }
-DriveTargets driveTargets(ControlState state) {
-    switch (state.speed) {
-    case SpeedLevel::Forward1: return {250, state.steering == SteeringState::Left ? static_cast<std::uint16_t>(150) : static_cast<std::uint16_t>(0), state.steering == SteeringState::Right ? static_cast<std::uint16_t>(150) : static_cast<std::uint16_t>(0)};
-    case SpeedLevel::Forward2: return {500, state.steering == SteeringState::Left ? static_cast<std::uint16_t>(250) : static_cast<std::uint16_t>(0), state.steering == SteeringState::Right ? static_cast<std::uint16_t>(250) : static_cast<std::uint16_t>(0)};
-    case SpeedLevel::Forward3: return {750, state.steering == SteeringState::Left ? static_cast<std::uint16_t>(150) : static_cast<std::uint16_t>(0), state.steering == SteeringState::Right ? static_cast<std::uint16_t>(150) : static_cast<std::uint16_t>(0)};
-    case SpeedLevel::Stopped: return {0, 0, 0};
-    }
-    return {0,0,0};
+WheelVelocityTargets driveTargets(ControlState state, const DriveVelocityConfig& config) {
+    if (state.speed == SpeedLevel::Stopped) return {0, 0};
+    const auto index = static_cast<std::size_t>(state.speed) - 1U;
+    if (index >= config.forward_speeds.size()) return {0, 0};
+
+    const auto maximum = std::max<MilliTurnsPerSecond>(0, config.maximum_velocity);
+    const auto outside = std::clamp(config.forward_speeds[index],
+                                    static_cast<MilliTurnsPerSecond>(0), maximum);
+    const auto ratio = std::min<std::uint16_t>(config.steering_ratios_milli[index], 1000U);
+    const auto inside = static_cast<MilliTurnsPerSecond>(
+        (static_cast<std::int64_t>(outside) * ratio) / 1000);
+
+    MilliTurnsPerSecond left = outside;
+    MilliTurnsPerSecond right = outside;
+    if (state.steering == SteeringState::Left) left = inside;
+    if (state.steering == SteeringState::Right) right = inside;
+    return {left * (config.left_direction_sign < 0 ? -1 : 1),
+            right * (config.right_direction_sign < 0 ? -1 : 1)};
 }
-WheelPwm wheelPwmFromTargets(DriveTargets t) { return {static_cast<std::uint16_t>(t.base_pwm > t.left_reduction ? t.base_pwm - t.left_reduction : 0), static_cast<std::uint16_t>(t.base_pwm > t.right_reduction ? t.base_pwm - t.right_reduction : 0)}; }
 }
