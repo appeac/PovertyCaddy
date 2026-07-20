@@ -36,11 +36,57 @@ void startCalibrationMode(){ g_cal.left_duty=0; g_cal.right_duty=0; g_cal.stop=t
 
 void recvCb(const esp_now_recv_info_t* info,const uint8_t* data,int len){ if(!info||!data||len<0)return; RawRx item{}; std::memcpy(item.mac,info->src_addr,6); item.len=len>64?64:len; std::memcpy(item.bytes,data,item.len); item.rssi=info->rx_ctrl?info->rx_ctrl->rssi:0; item.at_ms=nowMs(); raw_rx++; if(xQueueSend(g_raw_q,&item,0)!=pdTRUE){ RawRx drop{}; xQueueReceive(g_raw_q,&drop,0); if(xQueueSend(g_raw_q,&item,0)!=pdTRUE) rx_overflow++; }}
 void packetTask(void*){ SessionTracker tracker; RawRx raw{}; for(;;){ if(xQueueReceive(g_raw_q,&raw,portMAX_DELAY)==pdTRUE){ ControlPacket p{}; if(std::memcmp(raw.mac,cart_config::kWearableMac.data(),6)!=0) continue; DecodeResult d=decodeControlPacket(raw.bytes,raw.len,p); if(d!=DecodeResult::Valid) continue; AcceptedCommand cmd{}; auto vr=tracker.consider(p.session_id,p.sequence,{static_cast<SpeedLevel>(p.desired_speed),static_cast<SteeringState>(p.desired_steering)},raw.at_ms,false,cmd); if(vr==ValidationResult::Valid){accepted++; xQueueOverwrite(g_cmd_q,&cmd);} } }}
-void motorTask(void*){ MotorState st=MotorState::PushableIdle; AcceptedCommand cmd{}; bool have=false, require_stopped_after_estop=false; Ramp base(250),lr(1000),rr(1000); std::uint64_t last=nowMs(), state_at=last; TickType_t wake=xTaskGetTickCount(); for(;;){ auto now=nowMs(); auto elapsed=static_cast<std::uint32_t>(now-last); last=now; AcceptedCommand incoming{}; if(xQueueReceive(g_cmd_q,&incoming,0)==pdTRUE){ if(require_stopped_after_estop){ if(incoming.control.speed==SpeedLevel::Stopped) require_stopped_after_estop=false; else incoming.control.speed=SpeedLevel::Stopped; } cmd=incoming; have=true; }
- if(hw.estopActive()){ hw.forceSafeOutputs(); if(st!=MotorState::EmergencyStopped){st=MotorState::EmergencyStopped; state_at=now; estops++; state_transitions++;} require_stopped_after_estop=true; }
- else if(st==MotorState::EmergencyStopped){ hw.forceSafeOutputs(); if(!require_stopped_after_estop){st=MotorState::Braked; state_at=now; state_transitions++;} }
- else { bool timed=have && now-cmd.received_at_ms>1000; if(timed){timeouts++; have=false; cmd.control.speed=SpeedLevel::Stopped; st=MotorState::Coasting; state_at=now;} bool want=have && cmd.control.speed!=SpeedLevel::Stopped; if(!want && (st==MotorState::Running||st==MotorState::BrakeReleasing)){ st=MotorState::Coasting; state_at=now; base.reset(0); lr.reset(0); rr.reset(0); state_transitions++; } if(want && (st==MotorState::PushableIdle||st==MotorState::Braked||st==MotorState::Coasting)){ st=MotorState::BrakeReleasing; state_at=now; base.reset(0); lr.reset(0); rr.reset(0); state_transitions++; } if(st==MotorState::BrakeReleasing && now-state_at>=150){st=MotorState::Running; state_at=now; state_transitions++;} if(st==MotorState::Coasting && now-state_at>=2500){st=MotorState::Braked; state_at=now; state_transitions++;}
- switch(st){ case MotorState::PushableIdle: hw.setLeftPwm(0); hw.setRightPwm(0); hw.setLeftStop(true); hw.setRightStop(true); hw.setLeftBrake(false); hw.setRightBrake(false); break; case MotorState::BrakeReleasing: hw.setLeftPwm(0); hw.setRightPwm(0); hw.setLeftStop(false); hw.setRightStop(false); hw.setLeftBrake(false); hw.setRightBrake(false); break; case MotorState::Running:{ auto t=driveTargets(cmd.control); auto b=base.update(t.base_pwm,elapsed); auto l=lr.update(t.left_reduction,elapsed); auto r=rr.update(t.right_reduction,elapsed); auto pwm=wheelPwmFromTargets({b,l,r}); hw.setLeftStop(false); hw.setRightStop(false); hw.setLeftBrake(false); hw.setRightBrake(false); hw.setLeftPwm(pwm.left); hw.setRightPwm(pwm.right); break;} case MotorState::Coasting: hw.setLeftPwm(0); hw.setRightPwm(0); hw.setLeftStop(cart_config::kAssertStopDuringCoast); hw.setRightStop(cart_config::kAssertStopDuringCoast); hw.setLeftBrake(false); hw.setRightBrake(false); break; case MotorState::Braked: case MotorState::Fault: default: hw.forceSafeOutputs(); break; case MotorState::EmergencyStopped: break; } }
- vTaskDelayUntil(&wake,pdMS_TO_TICKS(5)); }}
+void motorTask(void*){
+ MotorConfig config{};
+ config.link_timeout_ms=1000;
+ config.stopped_policy=StoppedPolicy::Pushable;
+ config.standstill_velocity=5.0F;
+ MotorLogic logic(config);
+ AcceptedCommand cmd{};
+ bool have=false;
+ // The GPIO/PWM backend acknowledges the axis mode requested on the preceding
+ // cycle.  An ODrive backend supplies these same fields from its telemetry.
+ ODriveStatus status{{AxisState::Idle,true,0.0F},{AxisState::Idle,true,0.0F}};
+ AxisState applied_state=AxisState::Idle;
+ float measured_left=0.0F,measured_right=0.0F;
+ TickType_t wake=xTaskGetTickCount();
+ for(;;){
+  const auto now=nowMs();
+  bool newly_accepted=false;
+  AcceptedCommand incoming{};
+  if(xQueueReceive(g_cmd_q,&incoming,0)==pdTRUE){cmd=incoming;have=true;newly_accepted=true;}
+  const bool timed_out=have && now-cmd.received_at_ms>config.link_timeout_ms;
+  if(timed_out){timeouts++;have=false;}
+  MotorCommand desired{};
+  desired.newly_accepted=newly_accepted;
+  desired.emergency_stop=hw.estopActive();
+  desired.timed_out=timed_out;
+  desired.run=have && cmd.control.speed!=SpeedLevel::Stopped;
+  if(desired.run){
+   const auto targets=driveTargets(cmd.control);
+   const auto pwm=wheelPwmFromTargets(targets);
+   desired.left_velocity=static_cast<float>(pwm.left);
+   desired.right_velocity=static_cast<float>(pwm.right);
+  }
+  status.left.state=status.right.state=applied_state;
+  status.left.velocity=measured_left;
+  status.right.velocity=measured_right;
+  const MotorState before=logic.state();
+  const MotorOutput out=logic.update(now,desired,status);
+  if(logic.state()!=before){state_transitions++; if(logic.state()==MotorState::EmergencyStopped)estops++;}
+  applied_state=out.requested_axis_state;
+  measured_left=out.left_velocity;
+  measured_right=out.right_velocity;
+  if(logic.state()==MotorState::EmergencyStopped||logic.state()==MotorState::Fault){hw.forceSafeOutputs();}
+  else {
+   const bool idle=out.requested_axis_state==AxisState::Idle;
+   hw.setLeftStop(idle); hw.setRightStop(idle);
+   hw.setLeftBrake(false); hw.setRightBrake(false);
+   hw.setLeftPwm(idle?0:static_cast<std::uint16_t>(out.left_velocity));
+   hw.setRightPwm(idle?0:static_cast<std::uint16_t>(out.right_velocity));
+  }
+  vTaskDelayUntil(&wake,pdMS_TO_TICKS(5));
+ }
+}
 bool initNow(){ ESP_ERROR_CHECK(nvs_flash_init()); ESP_ERROR_CHECK(esp_netif_init()); ESP_ERROR_CHECK(esp_event_loop_create_default()); wifi_init_config_t cfg=WIFI_INIT_CONFIG_DEFAULT(); ESP_ERROR_CHECK(esp_wifi_init(&cfg)); ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_STA)); ESP_ERROR_CHECK(esp_wifi_start()); if(esp_now_init()!=ESP_OK)return false; esp_now_set_pmk(cart_config::kPmk.data()); esp_now_register_recv_cb(recvCb); esp_now_peer_info_t peer{}; std::memcpy(peer.peer_addr,cart_config::kWearableMac.data(),6); peer.ifidx=WIFI_IF_STA; peer.encrypt=true; std::memcpy(peer.lmk,cart_config::kLmk.data(),16); return esp_now_add_peer(&peer)==ESP_OK; }}
 extern "C" void app_main(){ if(!hw.initialize()){hw.forceSafeOutputs(); return;} if(cart_config::kCalibrationModeEnabled){ startCalibrationMode(); return; } g_raw_q=xQueueCreate(8,sizeof(RawRx)); g_cmd_q=xQueueCreate(1,sizeof(AcceptedCommand)); if(!g_raw_q||!g_cmd_q||!initNow()){hw.forceSafeOutputs(); return;} xTaskCreate(packetTask,"packet",4096,nullptr,5,nullptr); xTaskCreate(motorTask,"motor",4096,nullptr,6,nullptr); }
