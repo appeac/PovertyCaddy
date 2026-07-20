@@ -3,6 +3,7 @@
 #include "poor_caddy_protocol/sequence.hpp"
 #include "poor_caddy_protocol/session_tracker.hpp"
 #include "poor_caddy_protocol/ramp.hpp"
+#include "poor_caddy_protocol/motor_logic.hpp"
 #include <cassert>
 #include <cstring>
 using namespace poor_caddy;
